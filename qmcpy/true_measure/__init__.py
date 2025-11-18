@@ -9,6 +9,7 @@ from .bernoulli_cont import BernoulliCont
 from .johnsons_su import JohnsonsSU
 from .scipy_wrapper import SciPyWrapper
 from .matern_gp import MaternGP
+from .accept_reject import AcceptReject
 
 TrueMeasure = AbstractTrueMeasure
 _TrueMeasure = AbstractTrueMeasure
