@@ -1,18 +1,22 @@
 """
 Deterministic acceptance–rejection TrueMeasure (Zhu & Dick style).
 
-This class is meant to implement a QMC version of the acceptance–rejection
-sampler where:
-- The underlying discrete distribution lives in [0,1]^{d+1}
+This class implements a QMC version of the acceptance–rejection sampler.
+The underlying discrete distribution (driver) lives in [0,1]^{d_driver} with
+at least d+1 dimensions, where:
+
 - The first d coordinates are transformed by a proposal TrueMeasure to give
   Y ~ g      (proposal distribution)
-- The last coordinate v in [0,1] is used to deterministically accept/reject
+- The (d+1)-th coordinate v in [0,1] is used to deterministically accept/reject
   according to f(y) / (c * g(y)), where f is the target pdf and c is a
   known bound with f(x) <= c * g(x) for all x.
 
 Mathematically, this follows the spirit of Zhu & Dick’s deterministic
 acceptance–rejection sampler: we use one extra QMC dimension for the
-“acceptance variable” and we never randomize or shuffle the QMC points.
+“acceptance variable” and we never randomize or shuffle the driver points.
+The class itself is agnostic to the choice of driver: IID, digital nets,
+Halton, lattices, etc., as long as the driver conforms to the
+AbstractDiscreteDistribution interface.
 """
 
 from typing import Callable, Optional
@@ -27,36 +31,42 @@ from ..util import ParameterError, MethodImplementationError
 
 
 class AcceptReject(AbstractTrueMeasure):
-    """
-    QMC acceptance–rejection TrueMeasure.
+    """QMC acceptance–rejection TrueMeasure.
 
     Parameters
     ----------
     proposal_measure : AbstractTrueMeasure
-        A TrueMeasure that transforms the first d coordinates of the driver
-        into proposal samples Y ~ g. Its `discrete_distrib` is assumed to
-        have dimension d+1:
-            driver_dim = proposal_measure.discrete_distrib.d
-            target_dim = proposal_measure.d
-            driver_dim == target_dim + 1
-
-        The extra (last) coordinate of the driver is used as the
-        acceptance variable v in [0,1].
+        A TrueMeasure that transforms the first d coordinates of some driver
+        into proposal samples Y ~ g. Conceptually, we view the driver as
+        providing points in [0,1]^{d_driver}; the proposal measure should
+        consume at least the first d coordinates.
 
     target_pdf : Callable[[np.ndarray], np.ndarray]
-        The target density f(x) evaluated on an array of shape (..., d).
+        The target density f(x) evaluated on an array of shape (m, d).
 
     proposal_pdf : Callable[[np.ndarray], np.ndarray]
-        The proposal density g(x) evaluated on an array of shape (..., d).
+        The proposal density g(x) evaluated on an array of shape (m, d).
 
     bound_c : float
         A constant c such that  f(x) <= c * g(x)  for all x in the support.
         In Zhu & Dick's setup this gives the acceptance probability
+
             a(x) = f(x) / (c * g(x))  in [0,1].
+
+    driver_discrete_distrib : Optional[AbstractDiscreteDistribution]
+        Optional driver distribution in [0,1]^{d_driver}. If provided, this
+        driver will be used by the acceptance–rejection sampler. If not
+        provided, we fall back to ``proposal_measure.discrete_distrib``
+        (which must then be an AbstractDiscreteDistribution).
 
     batch_size : Optional[int], default None
         Optional minimum batch size for each call to the underlying
-        discrete distribution when more proposals are needed.
+        discrete distribution when more proposals are needed. If None,
+        a heuristic based on ``bound_c`` and the remaining requested
+        number of accepted samples is used.
+
+    name : str, default "AcceptReject"
+        Name used for pretty-printing.
 
     Notes
     -----
@@ -64,9 +74,9 @@ class AcceptReject(AbstractTrueMeasure):
       the default implementation in ``AbstractTrueMeasure``, because
       acceptance–rejection requires consuming more driver points than the
       number of accepted samples returned.
-    - We still behave as a TrueMeasure from the perspective of the rest
-      of QMCPy: calling ``AcceptReject(n)`` should return an (n, d) array
-      of samples from the target distribution.
+    - From the perspective of the rest of QMCPy, this is still a
+      TrueMeasure: calling ``AcceptReject(n)`` returns an (n, d) array of
+      samples from the target distribution.
     """
 
     def __init__(
@@ -87,14 +97,9 @@ class AcceptReject(AbstractTrueMeasure):
         self.batch_size = batch_size
         self.name = name
 
-        # --- Dimensions ----------------------------------------------------
-        # Target dimension (what integrands / integrals see)
         self.d = self.proposal_measure.d
 
-        # Driver distribution (what produces QMC points in [0,1]^{driver_dim})
         if driver_discrete_distrib is None:
-            # Fallback: use the proposal's own driver, but require it to
-            # have at least one extra dimension for the acceptance variable.
             driver = getattr(self.proposal_measure, "discrete_distrib", None)
             if not isinstance(driver, AbstractDiscreteDistribution):
                 raise ParameterError(
@@ -112,44 +117,25 @@ class AcceptReject(AbstractTrueMeasure):
         self.discrete_distrib = driver
         self.driver_dim = self.discrete_distrib.d
 
-        # We need at least one extra coordinate for the acceptance variable.
         if self.driver_dim < self.d + 1:
             raise ParameterError(
                 f"AcceptReject expects driver_dim >= d+1; got driver_dim={self.driver_dim}, "
                 f"target_dim={self.d}."
             )
-        # By default we use coordinate index self.d as the acceptance coord.
-        # If driver_dim > d+1, extra coordinates are simply unused.
-        # (We still keep the domain as [0,1]^{driver_dim}.)
 
-        # --- Transform chain structure ------------------------------------
-        # We conceptually compose on top of the proposal_measure:
-        #   (u, v) --proposal_measure--> Y = T(u)  (use first d coords)
-        #   then use v for accept/reject.
-        # The 'transform' attribute is the sub-transform in the chain.
         self.transform = self.proposal_measure
-        self.sub_compatibility_error = False  # we manage our own compatibility
+        self.sub_compatibility_error = False
 
-        # Domain: raw driver space. For the acceptance–rejection map this is
-        # [0,1]^{d+1} (unit cube in driver_dim dimensions).
         self.domain = np.tile([0.0, 1.0], (self.driver_dim, 1))
 
-        # Range: support of the target; same as the proposal's range.
-        # (We thin proposals by rejection, but do not move them.)
         self.range = self.proposal_measure.range
 
-        # Parameters to show in __repr__
         self.parameters = ["bound_c", "name"]
 
-        # Cache of extra accepted points not yet returned
         self._accepted_cache = np.empty((0, self.d))
 
-        # Let the base class validate domain/range/parameters
         super().__init__()
 
-    # ------------------------------------------------------------------
-    # Core sampling method: deterministic acceptance–rejection
-    # ------------------------------------------------------------------
     def gen_samples(
         self,
         n: int = None,
@@ -158,30 +144,51 @@ class AcceptReject(AbstractTrueMeasure):
         return_weights: bool = False,
         warn: bool = True,
     ):
-        """
-        Generate n samples from the target distribution using QMC
+        """Generate ``n`` samples from the target distribution using QMC
         acceptance–rejection.
 
-        Implements a deterministic AR scheme à la Zhu & Dick:
-        - underlying discrete distribution lives in [0,1]^{d+1}
-        - first d coords drive the proposal TrueMeasure
-        - last coord v ∈ [0,1] is used for acceptance test
+        The driver produces points X in [0,1]^{driver_dim}. We use
 
-            v <= f(Y) / (c * g(Y))
+            U = X[:, :d]     # proposal coordinates
+            V = X[:, d]      # acceptance coordinate in [0,1]
+
+        and transform
+
+            Y = proposal_measure._jacobian_transform_r(U, return_weights=False)
+
+        giving Y ~ g. We then accept those Y for which
+
+            V <= f(Y) / (c * g(Y)),
+
+        with c >= sup_x f(x)/g(x).
 
         Parameters
         ----------
         n : int
             Number of *accepted* samples requested.
-        return_weights : bool
-            If True, returns (samples, weights) where weights are 1.
+        n_min, n_max : ignored for now
+            Not supported in this implementation. Passing non-None values
+            will raise a ParameterError.
+        return_weights : bool, default False
+            If True, returns (samples, weights) where weights are identically 1
+            for accepted samples from the target measure.
+        warn : bool
+            Passed through to the underlying discrete distribution.
 
         Returns
         -------
-        samples : array, shape (n, d)
-        (samples, weights) if return_weights=True
+        samples : np.ndarray, shape (n, d)
+            Accepted samples from the target distribution.
+        (samples, weights) if return_weights=True, where weights is
+        an array of ones with shape (n,).
+
+        Raises
+        ------
+        ParameterError
+            If arguments are invalid or if acceptance appears to be
+            essentially zero (driver budget exceeded).
         """
-        # --- Argument validation --------------------------------------------------
+        # --- basic argument checks -----------------------------------------
         if n is None:
             raise ParameterError(
                 "AcceptReject.gen_samples requires n (number of accepted samples)."
@@ -191,33 +198,30 @@ class AcceptReject(AbstractTrueMeasure):
             raise ParameterError(f"n must be a positive integer; got {n}.")
 
         if n_min is not None or n_max is not None:
+            # We can extend to support these later, but for now we fail loudly.
             raise ParameterError(
-                "AcceptReject supports only gen_samples(n=...). "
+                "AcceptReject currently supports only gen_samples(n=...). "
                 "n_min and n_max are not supported."
             )
 
-        # --- 1. Use cached accepted samples first --------------------------------
+        # --- start with any cached accepted samples ------------------------
         accepted_chunks = []
 
         cache = self._accepted_cache
         if cache is not None and cache.shape[0] > 0:
             if cache.shape[0] >= n:
+                # We already have enough in the cache
                 samples = cache[:n]
                 self._accepted_cache = cache[n:]
                 if return_weights:
-                    return samples, np.ones(n)
+                    weights = np.ones(n, dtype=float)
+                    return samples, weights
                 return samples
             else:
+                # Use entire cache and clear it
                 accepted_chunks.append(cache)
-                n_remaining = n - cache.shape[0]
                 self._accepted_cache = np.empty((0, self.d))
-        else:
-            n_remaining = n
 
-        # --- 2. Safety cap to prevent infinite loops ------------------------------
-        # Max number of driver points we allow ourselves to consume.
-        # Theoretical acceptance ~ 1/c, so expected ~ n*c proposals needed.
-        # We allow up to 10x that, with a floor of 100k.
         max_driver_points = int(max(1e5, 10.0 * n * max(self.bound_c, 1.0)))
         used_driver_points = 0
 
@@ -226,93 +230,102 @@ class AcceptReject(AbstractTrueMeasure):
                 return 0
             return sum(chunk.shape[0] for chunk in accepted_chunks)
 
-        # --- 3. Main acceptance–rejection loop ------------------------------------
+        # --- main AR loop --------------------------------------------------
         while _accepted_so_far() < n:
             remaining_budget = max_driver_points - used_driver_points
             if remaining_budget <= 0:
                 raise ParameterError(
-                    "AcceptReject: driver point budget exceeded before collecting "
-                    "requested samples. Acceptance probability may be zero.\n"
+                    "AcceptReject: maximum driver point budget exceeded before "
+                    "collecting requested samples. This suggests that the "
+                    "acceptance probability is extremely small or zero. "
                     "Check target_pdf, proposal_pdf, and bound_c."
                 )
 
-            needed = n - _accepted_so_far()
+            need = n - _accepted_so_far()
 
-            # Choose batch size
             if self.batch_size is not None and self.batch_size > 0:
-                m = max(self.batch_size, needed)
+                m = max(self.batch_size, need)
             else:
-                # expected ~ needed * c
-                m = int(max(needed * self.bound_c, needed * 1.5))
+                m = int(max(need * self.bound_c, need * 1.5))
 
             m = min(m, remaining_budget)
             if m <= 0:
                 raise ParameterError(
-                    "AcceptReject: encountered non-positive batch size."
+                    "AcceptReject: non-positive batch size encountered."
                 )
 
-            # --- Draw m driver points in [0,1]^{d+1} --------------------------
             X = self.discrete_distrib(n=m, warn=warn)
+
             if X.shape[-1] != self.driver_dim:
                 raise ParameterError(
-                    f"Driver produced dimension {X.shape[-1]}, expected {self.driver_dim}."
+                    f"AcceptReject: driver produced points with dimension {X.shape[-1]}, "
+                    f"expected {self.driver_dim}."
                 )
 
             used_driver_points += m
 
-            # Split driver coords
-            U = X[:, : self.d]  # proposal coords
-            V = X[:, self.d]  # acceptance uniform
+            U = X[:, : self.d]
+            V = X[:, self.d]
 
-            # Transform proposals
             Y = self.proposal_measure._jacobian_transform_r(x=U, return_weights=False)
 
             if Y.shape[0] != m or Y.shape[-1] != self.d:
                 raise ParameterError(
-                    f"Proposal measure returned shape {Y.shape}, expected (?, {self.d})."
+                    f"AcceptReject: proposal_measure returned shape {Y.shape}, "
+                    f"expected (?, {self.d})."
                 )
 
-            # Evaluate PDFs
-            f_vals = np.asarray(self.target_pdf(Y), float).reshape(-1)
-            g_vals = np.asarray(self.proposal_pdf(Y), float).reshape(-1)
+            f_vals = np.asarray(self.target_pdf(Y), dtype=float).reshape(-1)
+            g_vals = np.asarray(self.proposal_pdf(Y), dtype=float).reshape(-1)
 
             if f_vals.shape[0] != m or g_vals.shape[0] != m:
                 raise ParameterError(
-                    f"target_pdf/proposal_pdf must return arrays of length {m}."
+                    "AcceptReject: target_pdf and proposal_pdf must return 1D arrays "
+                    f"of length m={m}."
                 )
 
-            # Acceptance probabilities
             a = np.zeros_like(f_vals)
             positive_g = g_vals > 0
+
             a[positive_g] = f_vals[positive_g] / (self.bound_c * g_vals[positive_g])
             a = np.clip(a, 0.0, 1.0)
 
-            # Deterministic acceptance
-            mask = V <= a
-            Y_acc = Y[mask, :]
+            accepted_mask = V <= a
+            Y_acc = Y[accepted_mask, :]
 
             if Y_acc.shape[0] > 0:
                 accepted_chunks.append(Y_acc)
 
-        # --- 4. Combine and cache leftovers ------------------------------------
-        all_acc = np.vstack(accepted_chunks)
-        samples = all_acc[:n, :]
-        extras = all_acc[n:, :]
+        if len(accepted_chunks) == 0:
+            raise ParameterError(
+                "AcceptReject: no samples accepted. This suggests that the "
+                "acceptance probability is effectively zero. Check "
+                "target_pdf, proposal_pdf, and bound_c."
+            )
+
+        if len(accepted_chunks) == 1:
+            all_accepted = accepted_chunks[0]
+        else:
+            all_accepted = np.vstack(accepted_chunks)
+
+        if all_accepted.shape[0] < n:
+            raise ParameterError(
+                "AcceptReject: internal error, fewer accepted samples than requested."
+            )
+
+        samples = all_accepted[:n, :]
+        extras = all_accepted[n:, :]
 
         self._accepted_cache = extras
 
         if return_weights:
-            return samples, np.ones(n, float)
+            weights = np.ones(n, dtype=float)
+            return samples, weights
+
         return samples
 
-    # ------------------------------------------------------------------
-    # Minimal implementations to satisfy AbstractTrueMeasure interface.
-    # We override gen_samples, so _transform/_weight are not used in the
-    # main flow, but they are required by the base class.
-    # ------------------------------------------------------------------
     def _transform(self, x: np.ndarray) -> np.ndarray:
-        """
-        Placeholder transform.
+        """Placeholder transform.
 
         In this design, ``gen_samples`` handles the full acceptance–rejection
         logic, so this method should not be called directly. It is defined
@@ -323,8 +336,7 @@ class AcceptReject(AbstractTrueMeasure):
         )
 
     def _weight(self, x: np.ndarray) -> np.ndarray:
-        """
-        Placeholder weight.
+        """Placeholder weight.
 
         For the accepted points, the target measure is already encoded in
         the AR logic, so the natural Jacobian weight is 1. This method is
@@ -333,10 +345,11 @@ class AcceptReject(AbstractTrueMeasure):
         raise MethodImplementationError(self, "_weight is not used for AcceptReject.")
 
     def _spawn(self, sampler: AbstractDiscreteDistribution, dimension: int):
-        """
+        """Spawn a new AcceptReject measure.
+
         Spawning for AcceptReject is non-trivial (it must preserve the
-        driver dimension = d+1 and the link to the proposal measure).
-        We will implement this once the basic sampler is working.
+        link to the proposal measure and ensure that the driver has at
+        least ``d+1`` dimensions). This is left unimplemented for now.
         """
         raise MethodImplementationError(
             self, "_spawn not yet implemented for AcceptReject."
