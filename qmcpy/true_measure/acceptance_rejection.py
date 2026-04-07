@@ -55,9 +55,27 @@ class AcceptanceRejection(AbstractTrueMeasure):
         >>> measure
         AcceptanceRejection (AbstractTrueMeasure)
             target_dim      1
-            upper_bound     2.0
-            density_integral 1.0
-            acceptance_rate 0.5
+            upper_bound     2^(1)
+            density_integral 1
+            acceptance_rate 2^(-1)
+
+        Continued sampling: two batches equal one single call.
+
+        >>> m1 = AcceptanceRejection(DigitalNetB2(dimension=2, seed=7), psi, upper_bound=2., density_integral=1.)
+        >>> b1 = m1.gen_samples(n_min=0, n_max=8)
+        >>> b2 = m1.gen_samples(n_min=8, n_max=16)
+        >>> m2 = AcceptanceRejection(DigitalNetB2(dimension=2, seed=7), psi, upper_bound=2., density_integral=1.)
+        >>> all_at_once = m2.gen_samples(n_min=0, n_max=16)
+        >>> np.allclose(np.concatenate([b1, b2]), all_at_once)
+        True
+
+        Calling with n_min > 0 without a prior call raises an error.
+
+        >>> m3 = AcceptanceRejection(DigitalNetB2(dimension=2, seed=7), psi, upper_bound=2., density_integral=1.)
+        >>> m3.gen_samples(n_min=8, n_max=16)
+        Traceback (most recent call last):
+            ...
+        qmcpy.util.exceptions_warnings.ParameterError: n_min > 0 but no prior call was made. Call gen_samples with n_min=0 first.
     """
 
     def __init__(self, sampler, target_density, upper_bound, density_integral, max_retries=4):
@@ -254,9 +272,26 @@ class AcceptanceRejectionReal(AbstractTrueMeasure):
         >>> measure
         AcceptanceRejectionReal (AbstractTrueMeasure)
             target_dim      1
-            upper_bound     2.0
-            density_integral 1.0
-            acceptance_rate 0.5
+            upper_bound     2^(1)
+            density_integral 1
+            acceptance_rate 2^(-1)
+
+        Continued sampling: batches resume the driver sequence without restarting.
+
+        >>> inv_cdfs = [lambda u: norm.ppf(u, loc=0, scale=2)]
+        >>> m1 = AcceptanceRejectionReal(DigitalNetB2(dimension=2, seed=7), psi, inv_cdfs=inv_cdfs, H_func=H, upper_bound=2., density_integral=1.)
+        >>> b1 = m1.gen_samples(n_min=0, n_max=8)
+        >>> b2 = m1.gen_samples(n_min=8, n_max=16)
+        >>> b1.shape, b2.shape
+        ((8, 1), (8, 1))
+
+        Calling with n_min > 0 without a prior call raises an error.
+
+        >>> m3 = AcceptanceRejectionReal(DigitalNetB2(dimension=2, seed=7), psi, inv_cdfs=inv_cdfs, H_func=H, upper_bound=2., density_integral=1.)
+        >>> m3.gen_samples(n_min=8, n_max=16)
+        Traceback (most recent call last):
+            ...
+        qmcpy.util.exceptions_warnings.ParameterError: n_min > 0 but no prior call was made. Call gen_samples with n_min=0 first.
     """
 
     def __init__(self, sampler, target_density, inv_cdfs, H_func,
