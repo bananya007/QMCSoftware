@@ -5,6 +5,13 @@ import warnings
 import math
 
 
+def _next_pow2(n):
+    """Smallest power of 2 >= n."""
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
 class AcceptanceRejection(AbstractTrueMeasure):
     """
     Deterministic Acceptance-Rejection (DAR) sampler on the unit cube.
@@ -79,21 +86,30 @@ class AcceptanceRejection(AbstractTrueMeasure):
         self.acceptance_rate = self.density_integral / self.upper_bound
         self.max_retries = int(max_retries)
         self.range = np.tile([0, 1], (self.target_dim, 1))
+        self._driver_offset = None
         super(AcceptanceRejection, self).__init__()
 
     def gen_samples(self, n=None, n_min=None, n_max=None, return_weights=False, warn=True):
         """
-        Generate n accepted samples from the target density.
+        Generate accepted samples from the target density.
 
         Unlike other TrueMeasures, this method cannot be decomposed into
         a fixed 1-to-1 _transform because acceptance-rejection produces
         a variable number of outputs from a fixed driver batch. gen_samples
         is therefore overridden directly.
 
+        Supports continued sampling: calling with n_min=0 starts fresh,
+        and subsequent calls with n_min>0 continue from the same driver
+        sequence position.
+
         Args:
-            n (int): Number of accepted samples to return.
-            n_min: Ignored. Included for interface compatibility.
-            n_max: Ignored. Included for interface compatibility.
+            n (int): Number of accepted samples to return. Treated as
+                n_min=0, n_max=n (always resets the driver sequence).
+            n_min (int): Starting accepted-sample index. Use 0 to reset
+                and start fresh. Use a positive value to continue from
+                the previous call.
+            n_max (int): Ending accepted-sample index (exclusive).
+                Number of samples returned is n_max - n_min.
             return_weights (bool): If True, also return importance weights
                 psi(x)/C for each accepted sample.
             warn (bool): If True, warn when fewer than n samples are
@@ -104,19 +120,36 @@ class AcceptanceRejection(AbstractTrueMeasure):
             weights (np.ndarray): Shape (n,). Only returned when
                 return_weights=True.
         """
+        if n_max is not None:
+            if n_min is None:
+                n_min = 0
+            n = n_max - n_min
         if n is None:
-            raise ParameterError("n must be supplied to AcceptanceRejection.gen_samples.")
+            raise ParameterError("Supply either n or both n_min and n_max to AcceptanceRejection.gen_samples.")
+        if n_min is None:
+            n_min = 0
+
+        if n_min == 0:
+            self._driver_offset = 0
+        else:
+            if self._driver_offset is None:
+                raise ParameterError(
+                    "n_min > 0 but no prior call was made. Call gen_samples with n_min=0 first."
+                )
 
         # choose smallest m such that 2^m >= ceil(n / acceptance_rate)
         M_min = int(math.ceil(n / max(self.acceptance_rate, 1e-12)))
         m = max(int(math.ceil(math.log2(max(M_min, 1)))), 1)
+        M = 2 ** m  # minimum driver batch size
 
         accepted_batches = []
         n_collected = 0
 
         for _ in range(1 + self.max_retries):
-            M = 2 ** m
-            Q = self.discrete_distrib(n=M)          # (M, s)
+            # align n_max to next power of 2 so both endpoints satisfy DigitalNetB2 constraints
+            n_max_driver = _next_pow2(self._driver_offset + M)
+            Q = self.discrete_distrib(n_min=self._driver_offset, n_max=n_max_driver, warn=False)
+            self._driver_offset = n_max_driver
             x = Q[:, :self.target_dim]              # (M, target_dim) candidates
             u = Q[:, -1]                            # (M,) thresholds
             psi_vals = self.target_density(x)       # (M,)
@@ -125,7 +158,6 @@ class AcceptanceRejection(AbstractTrueMeasure):
             n_collected += mask.sum()
             if n_collected >= n:
                 break
-            m += 1
 
         samples = np.concatenate(accepted_batches, axis=0)[:n]
 
@@ -255,21 +287,30 @@ class AcceptanceRejectionReal(AbstractTrueMeasure):
         self.acceptance_rate = self.density_integral / self.upper_bound
         self.max_retries = int(max_retries)
         self.range = np.tile([-np.inf, np.inf], (self.target_dim, 1))
+        self._driver_offset = None
         super(AcceptanceRejectionReal, self).__init__()
 
     def gen_samples(self, n=None, n_min=None, n_max=None, return_weights=False, warn=True):
         """
-        Generate n accepted samples from the target density on R^d.
+        Generate accepted samples from the target density on R^d.
 
         Unlike other TrueMeasures, this method cannot be decomposed into
         a fixed 1-to-1 _transform because acceptance-rejection produces
         a variable number of outputs from a fixed driver batch. gen_samples
         is therefore overridden directly.
 
+        Supports continued sampling: calling with n_min=0 starts fresh,
+        and subsequent calls with n_min>0 continue from the same driver
+        sequence position.
+
         Args:
-            n (int): Number of accepted samples to return.
-            n_min: Ignored. Included for interface compatibility.
-            n_max: Ignored. Included for interface compatibility.
+            n (int): Number of accepted samples to return. Treated as
+                n_min=0, n_max=n (always resets the driver sequence).
+            n_min (int): Starting accepted-sample index. Use 0 to reset
+                and start fresh. Use a positive value to continue from
+                the previous call.
+            n_max (int): Ending accepted-sample index (exclusive).
+                Number of samples returned is n_max - n_min.
             return_weights (bool): If True, also return importance weights
                 psi(z)/C for each accepted sample.
             warn (bool): If True, warn when fewer than n samples are
@@ -280,18 +321,35 @@ class AcceptanceRejectionReal(AbstractTrueMeasure):
             weights (np.ndarray): Shape (n,). Only returned when
                 return_weights=True.
         """
+        if n_max is not None:
+            if n_min is None:
+                n_min = 0
+            n = n_max - n_min
         if n is None:
-            raise ParameterError("n must be supplied to AcceptanceRejectionReal.gen_samples.")
+            raise ParameterError("Supply either n or both n_min and n_max to AcceptanceRejectionReal.gen_samples.")
+        if n_min is None:
+            n_min = 0
+
+        if n_min == 0:
+            self._driver_offset = 0
+        else:
+            if self._driver_offset is None:
+                raise ParameterError(
+                    "n_min > 0 but no prior call was made. Call gen_samples with n_min=0 first."
+                )
 
         M_min = int(math.ceil(n / max(self.acceptance_rate, 1e-12)))
         m = max(int(math.ceil(math.log2(max(M_min, 1)))), 1)
+        M = 2 ** m  # minimum driver batch size
 
         accepted_batches = []
         n_collected = 0
 
         for _ in range(1 + self.max_retries):
-            M = 2 ** m
-            Q = self.discrete_distrib(n=M)              # (M, s)
+            # align n_max to next power of 2 so both endpoints satisfy DigitalNetB2 constraints
+            n_max_driver = _next_pow2(self._driver_offset + M)
+            Q = self.discrete_distrib(n_min=self._driver_offset, n_max=n_max_driver, warn=False)
+            self._driver_offset = n_max_driver
             U = Q[:, :self.target_dim]                  # (M, target_dim) uniform coords
             u = Q[:, -1]                                # (M,) threshold
 
@@ -309,7 +367,6 @@ class AcceptanceRejectionReal(AbstractTrueMeasure):
             n_collected += mask.sum()
             if n_collected >= n:
                 break
-            m += 1
 
         samples = np.concatenate(accepted_batches, axis=0)[:n]
 
