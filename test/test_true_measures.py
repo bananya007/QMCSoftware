@@ -549,5 +549,137 @@ class TestGeometricBrownianMotion(unittest.TestCase):
         self.assertIsNotNone(gbm_eager._log_mvn_scipy_cache)
 
 
+class TestAcceptanceRejection(unittest.TestCase):
+    """Unit tests for AcceptanceRejection and AcceptanceRejectionReal."""
+
+    def setUp(self):
+        from qmcpy.true_measure import AcceptanceRejection, AcceptanceRejectionReal
+        from scipy.stats import norm
+        self.AcceptanceRejection = AcceptanceRejection
+        self.AcceptanceRejectionReal = AcceptanceRejectionReal
+        self.norm = norm
+        self.seed = 7
+
+        def psi(x): return 2 * x[:, 0]
+        self.psi = psi
+
+        def psi_real(z): return norm.pdf(z[:, 0], loc=0, scale=1)
+        def H(z): return norm.pdf(z[:, 0], loc=0, scale=2)
+        self.psi_real = psi_real
+        self.H = H
+        self.inv_cdfs = [lambda u: norm.ppf(u, loc=0, scale=2)]
+
+    def _make_ar(self, seed=None):
+        seed = seed if seed is not None else self.seed
+        return self.AcceptanceRejection(
+            DigitalNetB2(dimension=2, seed=seed),
+            self.psi, upper_bound=2., density_integral=1.
+        )
+
+    def _make_ar_real(self, seed=None):
+        seed = seed if seed is not None else self.seed
+        return self.AcceptanceRejectionReal(
+            DigitalNetB2(dimension=2, seed=seed),
+            self.psi_real,
+            inv_cdfs=self.inv_cdfs,
+            H_func=self.H,
+            upper_bound=2., density_integral=1.
+        )
+
+    # --- AcceptanceRejection tests ---
+
+    def test_basic_shape(self):
+        """gen_samples(n=8) returns shape (8, 1)."""
+        samples = self._make_ar().gen_samples(n=8)
+        self.assertEqual(samples.shape, (8, 1))
+
+    def test_samples_in_unit_interval(self):
+        """All accepted samples lie in [0, 1]."""
+        samples = self._make_ar().gen_samples(n=64)
+        self.assertTrue((samples >= 0).all() and (samples <= 1).all())
+
+    def test_continued_sampling_matches_single_call(self):
+        """Two batches via n_min/n_max equal one single call."""
+        m1 = self._make_ar()
+        b1 = m1.gen_samples(n_min=0, n_max=8)
+        b2 = m1.gen_samples(n_min=8, n_max=16)
+
+        m2 = self._make_ar()
+        all_at_once = m2.gen_samples(n_min=0, n_max=16)
+
+        np.testing.assert_array_almost_equal(
+            np.concatenate([b1, b2]), all_at_once
+        )
+
+    def test_n_resets_driver(self):
+        """Calling gen_samples(n=8) twice gives same result (driver resets)."""
+        m = self._make_ar()
+        s1 = m.gen_samples(n=8)
+        s2 = m.gen_samples(n=8)
+        np.testing.assert_array_equal(s1, s2)
+
+    def test_error_n_min_without_prior_call(self):
+        """n_min > 0 without a prior call raises ParameterError."""
+        m = self._make_ar()
+        with self.assertRaises(ParameterError):
+            m.gen_samples(n_min=8, n_max=16)
+
+    def test_error_invalid_upper_bound(self):
+        """upper_bound <= 0 raises ParameterError."""
+        with self.assertRaises(ParameterError):
+            self.AcceptanceRejection(
+                DigitalNetB2(dimension=2, seed=self.seed),
+                self.psi, upper_bound=0., density_integral=1.
+            )
+
+    def test_error_invalid_density_integral(self):
+        """density_integral <= 0 raises ParameterError."""
+        with self.assertRaises(ParameterError):
+            self.AcceptanceRejection(
+                DigitalNetB2(dimension=2, seed=self.seed),
+                self.psi, upper_bound=2., density_integral=0.
+            )
+
+    def test_error_sampler_dimension_too_small(self):
+        """Sampler dimension < 2 raises ParameterError."""
+        with self.assertRaises(ParameterError):
+            self.AcceptanceRejection(
+                DigitalNetB2(dimension=1, seed=self.seed),
+                self.psi, upper_bound=2., density_integral=1.
+            )
+
+    # --- AcceptanceRejectionReal tests ---
+
+    def test_real_basic_shape(self):
+        """AcceptanceRejectionReal gen_samples(n=8) returns shape (8, 1)."""
+        samples = self._make_ar_real().gen_samples(n=8)
+        self.assertEqual(samples.shape, (8, 1))
+
+    def test_real_continued_sampling_shapes(self):
+        """AcceptanceRejectionReal continued sampling returns correct shapes."""
+        m = self._make_ar_real()
+        b1 = m.gen_samples(n_min=0, n_max=8)
+        b2 = m.gen_samples(n_min=8, n_max=16)
+        self.assertEqual(b1.shape, (8, 1))
+        self.assertEqual(b2.shape, (8, 1))
+
+    def test_real_error_n_min_without_prior_call(self):
+        """AcceptanceRejectionReal n_min > 0 without prior call raises ParameterError."""
+        m = self._make_ar_real()
+        with self.assertRaises(ParameterError):
+            m.gen_samples(n_min=8, n_max=16)
+
+    def test_real_error_inv_cdfs_length_mismatch(self):
+        """inv_cdfs length != target_dim raises ParameterError."""
+        with self.assertRaises(ParameterError):
+            self.AcceptanceRejectionReal(
+                DigitalNetB2(dimension=2, seed=self.seed),
+                self.psi_real,
+                inv_cdfs=[],  # wrong length
+                H_func=self.H,
+                upper_bound=2., density_integral=1.
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
